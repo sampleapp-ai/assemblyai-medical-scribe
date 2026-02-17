@@ -1,0 +1,7 @@
+streamlit
+streamlit-webrtc
+websocket-client
+requests
+python-dotenv
+numpy
+scipy
