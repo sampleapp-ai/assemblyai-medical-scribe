@@ -21,10 +21,18 @@ load_dotenv()
 
 # --- Configuration ---
 # Try Streamlit secrets first (for Streamlit Cloud), then fall back to env var (for local dev)
+YOUR_API_KEY = None
 try:
     YOUR_API_KEY = st.secrets["ASSEMBLYAI_API_KEY"]
-except (KeyError, FileNotFoundError):
+except Exception:
+    pass
+
+if not YOUR_API_KEY:
     YOUR_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+
+if not YOUR_API_KEY:
+    st.error("Missing ASSEMBLYAI_API_KEY. Add it to Streamlit secrets or a .env file.")
+    st.stop()
 
 ASSEMBLYAI_SAMPLE_RATE = 16000
 CONNECTION_PARAMS = {
