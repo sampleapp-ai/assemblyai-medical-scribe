@@ -1,26 +1,12 @@
 import os
-import json
-import threading
-import queue
-import time
-import sys
-import struct
-
-import numpy as np
-from scipy.signal import resample as scipy_resample
-# import requests
-import websocket
-import av
-
+import requests
 import streamlit as st
-from streamlit_webrtc import WebRtcMode, webrtc_streamer
-from urllib.parse import urlencode
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # --- Configuration ---
-# Try Streamlit secrets first (for Streamlit Cloud), then fall back to env var (for local dev)
 YOUR_API_KEY = None
 try:
     YOUR_API_KEY = st.secrets["ASSEMBLYAI_API_KEY"]
@@ -35,337 +21,231 @@ if not YOUR_API_KEY:
     st.stop()
 
 ASSEMBLYAI_SAMPLE_RATE = 16000
-CONNECTION_PARAMS = {
-    "sample_rate": ASSEMBLYAI_SAMPLE_RATE,
-    "format_turns": "true",
-}
-API_ENDPOINT_BASE_URL = "wss://streaming.assemblyai.com/v3/ws"
-API_ENDPOINT = f"{API_ENDPOINT_BASE_URL}?{urlencode(CONNECTION_PARAMS)}"
-# LLM_GATEWAY_URL = "https://llm-gateway.assemblyai.com/v1/chat/completions"
-
-# Target chunk size: 50ms at 16kHz mono = 800 samples = 1600 bytes (matches console app)
-TARGET_CHUNK_SAMPLES = 800
-
-# --- Shared state (not in st.session_state because threads need direct access) ---
-# These are module-level singletons shared between the audio callback thread and main thread
-audio_queue = queue.Queue(maxsize=500)
-transcript_list = []
-transcript_lock = threading.Lock()
-stop_event = threading.Event()
-ws_connection = None
-ws_sender_thread = None
-ws_receiver_thread = None
-
-# Accumulator for resampled audio to build proper-sized chunks
-_pcm_accumulator = bytearray()
-_pcm_lock = threading.Lock()
+TOKEN_URL = "https://streaming.assemblyai.com/v3/token"
+WS_BASE = "wss://streaming.assemblyai.com/v3/ws"
 
 
-# --- Audio Processing Callback ---
-def audio_frame_callback(frame: av.AudioFrame) -> av.AudioFrame:
-    """
-    Called by streamlit-webrtc for each audio frame.
-    Converts to 16kHz mono PCM16 and enqueues for WebSocket sender.
-    """
-    global _pcm_accumulator
-
-    try:
-        # Get raw int16 samples from frame
-        arr = frame.to_ndarray()  # shape: (channels, samples) for s16 planar
-        source_rate = frame.sample_rate
-        num_channels = len(frame.layout.channels)
-
-        # Convert to float64 for resampling
-        samples = arr.flatten().astype(np.float64)
-
-        # Convert to mono
-        if num_channels > 1:
-            num_samples = len(samples) // num_channels
-            samples = samples[:num_samples * num_channels].reshape(num_samples, num_channels).mean(axis=1)
-
-        # Resample to 16kHz
-        if source_rate != ASSEMBLYAI_SAMPLE_RATE:
-            num_target = int(len(samples) * ASSEMBLYAI_SAMPLE_RATE / source_rate)
-            if num_target > 0:
-                samples = scipy_resample(samples, num_target)
-
-        # Convert to int16 bytes
-        pcm = np.clip(samples, -32768, 32767).astype(np.int16).tobytes()
-
-        # Accumulate and send in proper-sized chunks (800 samples = 1600 bytes)
-        chunk_bytes = TARGET_CHUNK_SAMPLES * 2  # 2 bytes per int16 sample
-        with _pcm_lock:
-            _pcm_accumulator.extend(pcm)
-            while len(_pcm_accumulator) >= chunk_bytes:
-                chunk = bytes(_pcm_accumulator[:chunk_bytes])
-                _pcm_accumulator = _pcm_accumulator[chunk_bytes:]
-                try:
-                    audio_queue.put_nowait(chunk)
-                except queue.Full:
-                    try:
-                        audio_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    audio_queue.put_nowait(chunk)
-    except Exception as e:
-        print(f"[AUDIO-CB] Error: {e}", file=sys.stderr)
-
-    return frame
-
-
-# --- WebSocket Management ---
-def ws_sender_loop():
-    """Read PCM bytes from audio_queue and send as binary frames to AssemblyAI."""
-    global ws_connection
-    chunks_sent = 0
-    while not stop_event.is_set():
-        try:
-            pcm_bytes = audio_queue.get(timeout=0.1)
-            if pcm_bytes and ws_connection:
-                ws_connection.send_binary(pcm_bytes)
-                chunks_sent += 1
-                if chunks_sent % 100 == 0:
-                    print(f"[WS-SENDER] Sent {chunks_sent} chunks ({len(pcm_bytes)} bytes each)", file=sys.stderr)
-        except queue.Empty:
-            continue
-        except Exception as e:
-            print(f"[WS-SENDER] Error: {e}", file=sys.stderr)
-            break
-    print(f"[WS-SENDER] Stopped. Total chunks sent: {chunks_sent}", file=sys.stderr)
-
-
-def ws_receiver_loop():
-    """Receive JSON messages from AssemblyAI and store formatted transcripts."""
-    global ws_connection
-    while not stop_event.is_set():
-        try:
-            ws_connection.settimeout(1.0)
-            message = ws_connection.recv()
-            if not message:
-                continue
-
-            data = json.loads(message)
-            msg_type = data.get("type")
-
-            if msg_type == "Begin":
-                print(f"[WS-RECV] Session began: ID={data.get('id')}", file=sys.stderr)
-
-            elif msg_type == "Turn":
-                transcript_text = data.get("transcript", "")
-                formatted = data.get("turn_is_formatted", False)
-                end_of_turn = data.get("end_of_turn", False)
-                print(f"[WS-RECV] Turn: formatted={formatted}, eot={end_of_turn}, text='{transcript_text[:80]}'", file=sys.stderr)
-                if formatted and transcript_text.strip():
-                    with transcript_lock:
-                        transcript_list.append(transcript_text)
-
-            elif msg_type == "Termination":
-                print(f"[WS-RECV] Terminated: audio={data.get('audio_duration_seconds', 0)}s", file=sys.stderr)
-                break
-            else:
-                print(f"[WS-RECV] Unknown: {msg_type}", file=sys.stderr)
-
-        except websocket.WebSocketTimeoutException:
-            continue
-        except Exception as e:
-            if not stop_event.is_set():
-                print(f"[WS-RECV] Error: {e}", file=sys.stderr)
-            break
-
-
-def start_websocket():
-    """Open WebSocket to AssemblyAI and start sender + receiver threads."""
-    global ws_connection, ws_sender_thread, ws_receiver_thread, _pcm_accumulator
-
-    stop_event.clear()
-    transcript_list.clear()
-    _pcm_accumulator = bytearray()
-
-    # Drain any stale audio from the queue
-    while not audio_queue.empty():
-        try:
-            audio_queue.get_nowait()
-        except queue.Empty:
-            break
-
-    print(f"[WS] Connecting to {API_ENDPOINT}", file=sys.stderr)
-    ws_connection = websocket.create_connection(
-        API_ENDPOINT,
-        header={"Authorization": YOUR_API_KEY},
-        enable_multithread=True,
+def get_temporary_token():
+    """Generate a one-time temporary token for browser-side AssemblyAI auth."""
+    resp = requests.get(
+        TOKEN_URL,
+        params={"expires_in_seconds": 480},
+        headers={"Authorization": YOUR_API_KEY},
     )
-    print("[WS] Connected!", file=sys.stderr)
+    resp.raise_for_status()
+    return resp.json()["token"]
 
-    ws_sender_thread = threading.Thread(target=ws_sender_loop, daemon=True)
-    ws_sender_thread.start()
-
-    ws_receiver_thread = threading.Thread(target=ws_receiver_loop, daemon=True)
-    ws_receiver_thread.start()
-
-
-def stop_websocket():
-    """Send Terminate message, close WebSocket, and join threads."""
-    global ws_connection, ws_sender_thread, ws_receiver_thread
-
-    stop_event.set()
-
-    if ws_connection:
-        try:
-            print("[WS] Sending Terminate...", file=sys.stderr)
-            ws_connection.send(json.dumps({"type": "Terminate"}))
-            time.sleep(2)
-        except Exception as e:
-            print(f"[WS] Terminate error: {e}", file=sys.stderr)
-        try:
-            ws_connection.close()
-        except Exception:
-            pass
-        ws_connection = None
-
-    if ws_sender_thread and ws_sender_thread.is_alive():
-        ws_sender_thread.join(timeout=2.0)
-    if ws_receiver_thread and ws_receiver_thread.is_alive():
-        ws_receiver_thread.join(timeout=2.0)
-
-    ws_sender_thread = None
-    ws_receiver_thread = None
-    print("[WS] Cleaned up.", file=sys.stderr)
-
-
-# --- LLM Gateway Analysis (disabled - account does not have LeMUR access) ---
-# def analyze_with_llm_gateway(text):
-#     """Post transcript to AssemblyAI LLM Gateway for coaching analysis."""
-#     headers = {
-#         "authorization": YOUR_API_KEY,
-#         "content-type": "application/json",
-#     }
-#
-#     prompt = (
-#         "You are a helpful coach. Provide an analysis of the transcript "
-#         "and offer areas to improve with exact quotes. Include no preamble. "
-#         "Start with an overall summary then get into the examples with feedback."
-#     )
-#
-#     llm_gateway_data = {
-#         "model": "claude-sonnet-4-20250514",
-#         "messages": [
-#             {"role": "user", "content": f"{prompt}\n\nTranscript: {text}"}
-#         ],
-#         "max_tokens": 4000,
-#     }
-#
-#     result = requests.post(
-#         LLM_GATEWAY_URL,
-#         headers=headers,
-#         json=llm_gateway_data,
-#     )
-#     response = result.json()
-#     print("LLM Gateway response:", response)
-#     if "choices" not in response:
-#         raise RuntimeError(f"LLM Gateway error: {response}")
-#     return response["choices"][0]["message"]["content"]
-
-
-# --- Session State (UI-only state) ---
-if "recording_active" not in st.session_state:
-    st.session_state.recording_active = False
-# if "analysis_result" not in st.session_state:
-#     st.session_state.analysis_result = None
-if "session_ended" not in st.session_state:
-    st.session_state.session_ended = False
-if "transcripts" not in st.session_state:
-    st.session_state.transcripts = []
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="AssemblyAI Streaming STT", layout="wide")
 st.title("AssemblyAI Streaming STT")
 st.caption("Real-time speech-to-text powered by AssemblyAI")
 
-# Status indicator
+# Session state
+if "transcripts" not in st.session_state:
+    st.session_state.transcripts = []
+
+# Generate a fresh token for the browser component
+token = get_temporary_token()
+
+# Status / transcript placeholders
 status_placeholder = st.empty()
+status_placeholder.info("Ready. Click **Start Recording** to begin.")
 
-# WebRTC audio capture — SENDONLY with audio_frame_callback (no media player rendered)
-webrtc_ctx = webrtc_streamer(
-    key="assemblyai-stt",
-    mode=WebRtcMode.SENDONLY,
-    audio_frame_callback=audio_frame_callback,
-    media_stream_constraints={"video": False, "audio": True},
-    rtc_configuration={
-        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-    },
-)
-
-# Transcript display
 st.subheader("Live Transcript")
 transcript_placeholder = st.empty()
 
-# # Analysis section (disabled - account does not have LeMUR access)
-# st.subheader("Coaching Analysis")
-#
-# analysis_placeholder = st.empty()
-#
-# # Display previous analysis if exists
-# if st.session_state.analysis_result:
-#     analysis_placeholder.markdown(st.session_state.analysis_result)
+# Display any previously collected transcripts
+if st.session_state.transcripts:
+    transcript_placeholder.markdown("\n\n".join(st.session_state.transcripts))
 
-# --- Handle WebRTC state changes ---
-if webrtc_ctx.state.playing:
-    if not st.session_state.recording_active:
-        try:
-            start_websocket()
-            st.session_state.recording_active = True
-            st.session_state.session_ended = False
-            st.session_state.transcripts = []
-        except Exception as e:
-            print(f"[ERROR] Failed to connect: {e}", file=sys.stderr)
-            status_placeholder.error(f"Failed to connect to AssemblyAI: {e}")
-            st.stop()
+# --- Browser-side audio capture + AssemblyAI streaming component ---
+# Everything below runs in an iframe: mic capture, WebSocket to AssemblyAI,
+# and transcript display. No WebRTC / TURN server needed.
 
-    status_placeholder.success("Recording... Speak into your microphone.")
+AUDIO_COMPONENT_HTML = f"""
+<div id="controls" style="margin-bottom: 1rem;">
+  <button id="startBtn" onclick="startRecording()"
+    style="padding: 10px 24px; font-size: 16px; background: #4CAF50; color: white;
+           border: none; border-radius: 6px; cursor: pointer; margin-right: 8px;">
+    Start Recording
+  </button>
+  <button id="stopBtn" onclick="stopRecording()" disabled
+    style="padding: 10px 24px; font-size: 16px; background: #f44336; color: white;
+           border: none; border-radius: 6px; cursor: pointer; opacity: 0.5;">
+    Stop Recording
+  </button>
+  <span id="status" style="margin-left: 12px; font-size: 14px; color: #666;"></span>
+</div>
+<div id="transcript"
+  style="white-space: pre-wrap; font-family: sans-serif; font-size: 15px;
+         line-height: 1.6; padding: 12px; border: 1px solid #ddd; border-radius: 8px;
+         min-height: 120px; max-height: 400px; overflow-y: auto; background: #fafafa;">
+</div>
 
-    # Live transcript polling loop
-    while webrtc_ctx.state.playing:
-        time.sleep(0.5)
-        with transcript_lock:
-            current = list(transcript_list)
-        if current:
-            st.session_state.transcripts = current
-            transcript_placeholder.markdown("\n\n".join(current))
+<script>
+const SAMPLE_RATE = {ASSEMBLYAI_SAMPLE_RATE};
+const TOKEN = "{token}";
+const WS_URL = "{WS_BASE}?sample_rate=" + SAMPLE_RATE + "&format_turns=true&encoding=pcm_s16le&token=" + TOKEN;
 
-else:
-    if st.session_state.recording_active:
-        # Snapshot transcripts into session state before stopping
-        with transcript_lock:
-            if transcript_list:
-                st.session_state.transcripts = list(transcript_list)
-        stop_websocket()
-        st.session_state.recording_active = False
-        st.session_state.session_ended = True
+let audioContext = null;
+let mediaStream = null;
+let workletNode = null;
+let ws = null;
+let transcripts = [];
+let currentPartial = "";
 
-    if st.session_state.session_ended:
-        status_placeholder.warning("Recording stopped.")
-        current = st.session_state.transcripts
-        if current:
-            transcript_placeholder.markdown("\n\n".join(current))
-            st.download_button(
-                "Download Transcript",
-                data="\n\n".join(current),
-                file_name="transcript.txt",
-                mime="text/plain",
-            )
+function setStatus(msg, color) {{
+  document.getElementById("status").textContent = msg;
+  document.getElementById("status").style.color = color || "#666";
+}}
 
-        # # LLM Gateway analysis (disabled - account does not have LeMUR access)
-        # analyze_clicked = st.button("Analyze with LLM Gateway", disabled=len(current) == 0)
-        # if analyze_clicked and current:
-        #     full_transcript = "\n".join(current)
-        #     status_placeholder.info("Analyzing transcript with LLM Gateway...")
-        #     with st.spinner("Analyzing..."):
-        #         try:
-        #             result = analyze_with_llm_gateway(full_transcript)
-        #             st.session_state.analysis_result = result
-        #             analysis_placeholder.markdown(result)
-        #             status_placeholder.success("Analysis complete!")
-        #         except Exception as e:
-        #             status_placeholder.error(f"Analysis failed: {e}")
-    else:
-        status_placeholder.info("Ready. Click START to begin recording.")
+function renderTranscript() {{
+  const el = document.getElementById("transcript");
+  let text = transcripts.join("\\n\\n");
+  if (currentPartial) {{
+    if (text) text += "\\n\\n";
+    text += currentPartial + " ...";
+  }}
+  el.textContent = text || "(waiting for speech...)";
+  el.scrollTop = el.scrollHeight;
+}}
+
+async function startRecording() {{
+  try {{
+    document.getElementById("startBtn").disabled = true;
+    document.getElementById("stopBtn").disabled = false;
+    document.getElementById("stopBtn").style.opacity = "1";
+    document.getElementById("startBtn").style.opacity = "0.5";
+    transcripts = [];
+    currentPartial = "";
+    renderTranscript();
+    setStatus("Connecting...", "#FF9800");
+
+    // 1. Open WebSocket to AssemblyAI
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {{
+      setStatus("Recording... speak now", "#4CAF50");
+      console.log("[WS] Connected to AssemblyAI");
+    }};
+
+    ws.onmessage = (event) => {{
+      const data = JSON.parse(event.data);
+      if (data.type === "Turn") {{
+        const text = data.transcript || "";
+        if (data.turn_is_formatted && text.trim()) {{
+          // Final formatted turn — add to list
+          transcripts.push(text);
+          currentPartial = "";
+        }} else if (text.trim()) {{
+          // Partial / unformatted — show as in-progress
+          currentPartial = text;
+        }}
+        renderTranscript();
+      }} else if (data.type === "Termination") {{
+        console.log("[WS] Session terminated");
+        setStatus("Session ended", "#666");
+      }} else if (data.type === "Begin") {{
+        console.log("[WS] Session began:", data.id);
+      }}
+    }};
+
+    ws.onerror = (err) => {{
+      console.error("[WS] Error:", err);
+      setStatus("WebSocket error", "#f44336");
+    }};
+
+    ws.onclose = () => {{
+      console.log("[WS] Closed");
+    }};
+
+    // 2. Capture microphone audio
+    mediaStream = await navigator.mediaDevices.getUserMedia({{
+      audio: {{
+        sampleRate: SAMPLE_RATE,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+      }},
+      video: false,
+    }});
+
+    audioContext = new AudioContext({{ sampleRate: SAMPLE_RATE }});
+    const source = audioContext.createMediaStreamSource(mediaStream);
+
+    // Use ScriptProcessorNode (widely supported) to get raw PCM
+    const bufferSize = 4096;
+    const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+
+    processor.onaudioprocess = (e) => {{
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const float32 = e.inputBuffer.getChannelData(0);
+      // Convert float32 [-1,1] to int16
+      const int16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {{
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }}
+      ws.send(int16.buffer);
+    }};
+
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+
+    // Store processor ref for cleanup
+    window._sttProcessor = processor;
+    window._sttSource = source;
+
+  }} catch (err) {{
+    console.error("Start error:", err);
+    setStatus("Error: " + err.message, "#f44336");
+    document.getElementById("startBtn").disabled = false;
+    document.getElementById("stopBtn").disabled = true;
+    document.getElementById("startBtn").style.opacity = "1";
+    document.getElementById("stopBtn").style.opacity = "0.5";
+  }}
+}}
+
+function stopRecording() {{
+  document.getElementById("stopBtn").disabled = true;
+  document.getElementById("startBtn").disabled = true;
+  document.getElementById("stopBtn").style.opacity = "0.5";
+  setStatus("Stopping...", "#FF9800");
+
+  // Disconnect audio
+  if (window._sttProcessor) {{
+    window._sttProcessor.disconnect();
+    window._sttProcessor = null;
+  }}
+  if (window._sttSource) {{
+    window._sttSource.disconnect();
+    window._sttSource = null;
+  }}
+  if (audioContext) {{
+    audioContext.close();
+    audioContext = null;
+  }}
+  if (mediaStream) {{
+    mediaStream.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+  }}
+
+  // Send Terminate to AssemblyAI
+  if (ws && ws.readyState === WebSocket.OPEN) {{
+    ws.send(JSON.stringify({{ type: "Terminate" }}));
+    setTimeout(() => {{
+      ws.close();
+      ws = null;
+      setStatus("Stopped. Refresh the page to record again.", "#666");
+    }}, 1500);
+  }} else {{
+    setStatus("Stopped. Refresh the page to record again.", "#666");
+  }}
+}}
+</script>
+"""
+
+components.html(AUDIO_COMPONENT_HTML, height=500)
