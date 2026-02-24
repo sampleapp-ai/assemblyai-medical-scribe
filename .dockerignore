@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.devcontainer
+.claude
+__pycache__
+*.pyc
+*.pyo
+README.md
+fly.toml
