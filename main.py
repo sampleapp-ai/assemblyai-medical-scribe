@@ -224,7 +224,6 @@ token = get_temporary_token()
 
 # --- Sidebar ---
 with st.sidebar:
-    st.image("https://www.assemblyai.com/blog/content/images/2024/01/image-34.png", width=200)
     st.markdown("## Encounter Setup")
 
     specialty = st.selectbox(
